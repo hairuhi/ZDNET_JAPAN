@@ -1,0 +1,35 @@
+name: ZDNet JP Software Crawler
+
+on:
+  schedule:
+    # JST 09:00 / 12:00 / 15:00 / 18:00
+    #   → UTC 기준으로 00, 03, 06, 09 시
+    - cron: "0 0,3,6,9 * * *"
+  workflow_dispatch:
+
+jobs:
+  crawl-and-send:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run crawler
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_URL: https://japan.zdnet.com/software/
+          STORAGE_FILE: seen_articles.json
+        run: |
+          python main.py
