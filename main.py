@@ -1,7 +1,7 @@
 import os
 import re
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
 import requests
@@ -10,20 +10,28 @@ from dotenv import load_dotenv
 from googletrans import Translator
 
 
-# ======== 설정 로드 ========
 load_dotenv()
+
+# --- 환경 변수 ---
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TARGET_URL = os.getenv("TARGET_URL", "https://japan.zdnet.com/software/")
-STORAGE_FILE = os.getenv("STORAGE_FILE", "seen_articles.json")
+
+# 기본 URL (필요하면 .env나 GitHub Secrets에서 덮어쓰기 가능)
+JAPAN_SOFTWARE_URL = os.getenv(
+    "JAPAN_SOFTWARE_URL", "https://japan.zdnet.com/software/"
+)
+KOREA_AI_URL = os.getenv(
+    "KOREA_AI_URL",
+    "https://zdnet.co.kr/newskey/?lstcode=%EC%9D%B8%EA%B3%B5%EC%A7%80%EB%8A%A5",
+)
+
+# 중복 방지용 스토리지 파일 경로
+STORAGE_PATH = os.getenv("STORAGE_PATH", "sent_articles.json")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; ZDNetCrawler/1.0; +https://github.com/yourname)"
 }
-
-# JST (일본 시간)
-JST = timezone(timedelta(hours=9))
 
 translator = Translator()
 
@@ -40,93 +48,46 @@ def ensure_config():
         missing.append("TELEGRAM_CHAT_ID")
 
     if missing:
-        raise ConfigError(
-            "환경변수가 부족해요: " + ", ".join(missing)
-        )
+        raise ConfigError("환경변수가 부족해요: " + ", ".join(missing))
+
+
+# --- 공통 유틸 ---
 
 
 def fetch_html(url: str) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp = requests.get(url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     return resp.text
 
 
-def parse_title_and_datetime(raw_text: str):
-    """
-    앵커 텍스트에서
-    '... 2025-11-16 10:01' 형태의 날짜/시간을 떼어내고
-    (제목, datetime) 을 리턴.
-    datetime 파싱 실패 시 published_at은 None.
-    """
-    if not raw_text:
-        return "", None
-
-    m = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*$", raw_text)
-    if not m:
-        # 날짜가 없으면 제목만 반환
-        return raw_text.strip(), None
-
-    dt_str = m.group(1)
-    title_part = raw_text[:m.start(1)].strip()
+def load_sent_storage() -> dict:
+    if not os.path.exists(STORAGE_PATH):
+        return {}
     try:
-        published_at = datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
-    except ValueError:
-        published_at = None
+        with open(STORAGE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            return {}
+    except Exception:
+        return {}
 
-    return title_part, published_at
+
+def save_sent_storage(data: dict):
+    with open(STORAGE_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def extract_new_articles(html: str, base_url: str, now_jst: datetime):
+def is_within_last_24h(dt: datetime) -> bool:
     """
-    '新着' 섹션에서 지난 24시간 이내 기사만 추출.
-    각 아이템: {title_ja_raw, title_ja, url, published_at}
+    기사 시간은 JST/KST(+9) 기준이라고 가정하고,
+    현재 UTC에 +9시간을 더한 '로컬 시간'과 비교해요.
     """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # "新着" 헤더 찾기 (h2 / h3)
-    header = soup.find(
-        lambda tag: tag.name in ["h2", "h3"]
-        and tag.get_text(strip=True).startswith("新着")
-    )
-    if not header:
-        print("[WARN] '新着' 섹션을 찾지 못했어요.")
-        return []
-
-    articles = []
-
-    # '新着' 이후 형제들을 훑다가 다른 섹션(예: '読まれている記事') 나오면 중단
-    for sibling in header.find_next_siblings():
-        if sibling.name in ["h2", "h3"]:
-            # 새 섹션 시작 → 종료
-            break
-
-        for a in sibling.find_all("a", href=True):
-            raw_title = a.get_text(strip=True)
-            if not raw_title:
-                continue
-            # 너무 짧은 텍스트(아이콘 등)는 스킵
-            if len(raw_title) < 8:
-                continue
-
-            title_ja, published_at = parse_title_and_datetime(raw_title)
-
-            # 지난 24시간 이내 필터
-            if published_at is not None:
-                if now_jst - published_at > timedelta(hours=24):
-                    continue
-
-            url = urljoin(base_url, a["href"])
-
-            articles.append(
-                {
-                    "title_ja_raw": raw_title,
-                    "title_ja": title_ja,
-                    "url": url,
-                    "published_at": published_at.isoformat() if published_at else None,
-                }
-            )
-
-    return articles
+    if dt is None:
+        return False
+    now_local = datetime.utcnow() + timedelta(hours=9)
+    cutoff = now_local - timedelta(hours=24)
+    return cutoff <= dt <= now_local
 
 
 def translate_title_ja_to_ko(text_ja: str) -> str | None:
@@ -141,27 +102,32 @@ def translate_title_ja_to_ko(text_ja: str) -> str | None:
 
 
 def format_telegram_message(item: dict) -> str:
-    title_ja = item.get("title_ja") or item.get("title_ja_raw") or "(제목 없음)"
-    title_ko = item.get("title_ko") or "(번역 실패ㅠㅠ)"
+    source = item.get("source", "")
     url = item.get("url", "")
     published_at = item.get("published_at")
 
-    if published_at:
-        # 보기 좋게 포맷팅
-        try:
-            dt = datetime.fromisoformat(published_at)
-            published_str = dt.astimezone(JST).strftime("%Y-%m-%d %H:%M (%Z)")
-        except Exception:
-            published_str = published_at
+    if source == "zdnet_jp":
+        title_ja = item.get("title_ja") or "(제목 없음)"
+        title_ko = item.get("title_ko") or "(번역 실패ㅠㅠ)"
+        source_label = "🇯🇵 ZDNet Japan (Software)"
+        text = (
+            f"{source_label}\n"
+            f"📰 원문 제목(JP): {title_ja}\n"
+            f"🇰🇷 번역 제목(KO): {title_ko}\n"
+        )
+    elif source == "zdnet_kr_ai":
+        title_ko = item.get("title_ko") or "(제목 없음)"
+        source_label = "🇰🇷 ZDNet Korea (AI)"
+        text = f"{source_label}\n📰 제목: {title_ko}\n"
     else:
-        published_str = "알 수 없음"
+        title = item.get("title") or "(제목 없음)"
+        source_label = "📰 ZDNet"
+        text = f"{source_label}\n제목: {title}\n"
 
-    text = (
-        "📰 원문 제목 (JP): " + title_ja + "\n"
-        "🇰🇷 번역 제목 (KO): " + title_ko + "\n"
-        "🕒 게재 시각: " + published_str + "\n"
-        "🔗 URL: " + url
-    )
+    if isinstance(published_at, datetime):
+        text += f"🕒 기사 시각: {published_at.strftime('%Y-%m-%d %H:%M')}\n"
+
+    text += f"🔗 URL: {url}"
     return text
 
 
@@ -175,83 +141,255 @@ def send_to_telegram(items: list[dict]):
             "text": text,
         }
         try:
-            resp = requests.post(api_url, json=payload, timeout=15)
+            resp = requests.post(api_url, json=payload, timeout=20)
             if not resp.ok:
                 print("텔레그램 전송 실패:", resp.status_code, resp.text)
         except Exception as e:
             print("텔레그램 요청 에러:", e)
 
 
-# ======== 중복 방지용 storage ========
-def load_seen_urls(path: str) -> set[str]:
-    if not os.path.exists(path):
-        return set()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # 리스트 혹은 dict 모두 대비
-        if isinstance(data, list):
-            return set(data)
-        elif isinstance(data, dict):
-            return set(data.get("urls", []))
-        else:
-            return set()
-    except Exception as e:
-        print(f"[WARN] storage 파일 로드 실패 ({path}): {e}")
-        return set()
+# --- 일본 ZDNet (software) ---
 
 
-def save_seen_urls(path: str, urls: set[str]):
+def clean_title_jp(raw_title: str) -> str:
+    """
+    제목 뒤에 붙은 날짜/시간(예: ' ... 2025-11-16 08:00') 부분 제거.
+    """
+    if not raw_title:
+        return ""
+    cleaned = re.sub(r"\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}.*$", "", raw_title).strip()
+    return cleaned
+
+
+def extract_new_articles_jp_list(html: str, base_url: str) -> list[dict]:
+    """
+    일본 ZDNet software 페이지에서 '新着' 섹션 위주로 기사 목록을 가져와요.
+    여기서는 '제목 + URL'까지만 뽑고, 시간 정보는 기사 본문에서 다시 가져와요.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    header = soup.find(
+        lambda tag: tag.name in ["h2", "h3"]
+        and tag.get_text(strip=True).startswith("新着")
+    )
+    if not header:
+        print("[JP] 新着 섹션을 못 찾았어요 ㅠㅠ")
+        return []
+
+    articles: list[dict] = []
+
+    # '新着' 이후 형제들을 돌다가 다른 큰 섹션(h2/h3)이 나오면 종료
+    for sibling in header.find_next_siblings():
+        if sibling.name in ["h2", "h3"]:
+            break
+
+        for a in sibling.find_all("a", href=True):
+            title = a.get_text(strip=True)
+            if not title:
+                continue
+            if len(title) < 8:
+                continue
+
+            url = urljoin(base_url, a["href"])
+            articles.append(
+                {
+                    "source": "zdnet_jp",
+                    "title_ja_raw": title,
+                    "title_ja": clean_title_jp(title),
+                    "url": url,
+                }
+            )
+
+    return articles
+
+
+def fetch_published_at_jp(article_url: str) -> datetime | None:
+    """
+    일본 ZDNet 기사 본문에서 '2025-11-16 08:00' 같은 형식으로 된 날짜를 찾고 datetime으로 변환.
+    """
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(sorted(list(urls)), f, ensure_ascii=False, indent=2)
+        html = fetch_html(article_url)
     except Exception as e:
-        print(f"[WARN] storage 파일 저장 실패 ({path}): {e}")
+        print(f"[JP] 기사 페이지 요청 실패: {article_url} ({e})")
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    # '2025-11-16 08:00' 같은 문자열을 포함한 텍스트 노드 찾기
+    text_node = soup.find(string=re.compile(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}"))
+    if not text_node:
+        return None
+
+    m = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text_node)
+    if not m:
+        return None
+
+    dt_str = m.group(1)
+    try:
+        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+        return dt
+    except ValueError:
+        return None
+
+
+def collect_recent_articles_jp() -> list[dict]:
+    print(f"[JP] Fetching list page: {JAPAN_SOFTWARE_URL}")
+    html = fetch_html(JAPAN_SOFTWARE_URL)
+    candidates = extract_new_articles_jp_list(html, JAPAN_SOFTWARE_URL)
+    print(f"[JP] 후보 기사 {len(candidates)}개 발견")
+
+    recent: list[dict] = []
+    for item in candidates:
+        url = item["url"]
+        dt = fetch_published_at_jp(url)
+        if not dt:
+            print(f"[JP] 날짜 파싱 실패, 스킵: {url}")
+            continue
+        item["published_at"] = dt
+        if is_within_last_24h(dt):
+            recent.append(item)
+
+    print(f"[JP] 지난 24시간 기사 {len(recent)}개")
+    return recent
+
+
+# --- 한국 ZDNet (인공지능 리스트) ---
+
+
+def extract_new_articles_kr_ai_list(html: str, base_url: str) -> list[dict]:
+    """
+    인공지능 리스트 페이지에서 기사 제목 + URL만 추출.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    header = soup.find(
+        lambda tag: tag.name in ["h2", "h3"]
+        and "인공지능 최신뉴스" in tag.get_text()
+    )
+    if not header:
+        print("[KR] '인공지능 최신뉴스' 섹션을 못 찾았어요 ㅠㅠ")
+        return []
+
+    articles: list[dict] = []
+
+    # '인공지능 최신뉴스' 이후 형제들을 돌다가 '지금 뜨는 기사' 섹션(h2/h3) 나오면 종료
+    for sibling in header.find_next_siblings():
+        if sibling.name in ["h2", "h3"] and "지금 뜨는 기사" in sibling.get_text():
+            break
+
+        for a in sibling.find_all("a", href=True):
+            href = a["href"]
+            if "/view/?no=" not in href:
+                continue
+            title = a.get_text(strip=True)
+            if not title:
+                continue
+            url = urljoin(base_url, href)
+            articles.append(
+                {
+                    "source": "zdnet_kr_ai",
+                    "title_ko": title,
+                    "url": url,
+                }
+            )
+
+    return articles
+
+
+def fetch_published_at_kr(article_url: str) -> datetime | None:
+    """
+    한국 ZDNet 기사 페이지에서
+    '입력 :2025/11/14 17:46    수정: 2025/11/14 17:48'
+    같은 부분에서 '입력' 시각을 파싱.
+    """
+    try:
+        html = fetch_html(article_url)
+    except Exception as e:
+        print(f"[KR] 기사 페이지 요청 실패: {article_url} ({e})")
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    text_node = soup.find(string=re.compile(r"입력\s*:?\s*\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}"))
+    if not text_node:
+        return None
+
+    m = re.search(r"입력\s*:?\s*(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})", text_node)
+    if not m:
+        return None
+
+    dt_str = m.group(1)
+    try:
+        dt = datetime.strptime(dt_str, "%Y/%m/%d %H:%M")
+        return dt
+    except ValueError:
+        return None
+
+
+def collect_recent_articles_kr_ai() -> list[dict]:
+    print(f"[KR] Fetching AI list page: {KOREA_AI_URL}")
+    html = fetch_html(KOREA_AI_URL)
+    candidates = extract_new_articles_kr_ai_list(html, KOREA_AI_URL)
+    print(f"[KR] 후보 기사 {len(candidates)}개 발견")
+
+    recent: list[dict] = []
+    for item in candidates:
+        url = item["url"]
+        dt = fetch_published_at_kr(url)
+        if not dt:
+            print(f"[KR] 날짜 파싱 실패, 스킵: {url}")
+            continue
+        item["published_at"] = dt
+        if is_within_last_24h(dt):
+            recent.append(item)
+
+    print(f"[KR] 지난 24시간 기사 {len(recent)}개")
+    return recent
+
+
+# --- 메인 로직 ---
 
 
 def main():
     ensure_config()
 
-    now_jst = datetime.now(JST)
-    print(f"[INFO] 현재(JST): {now_jst.isoformat()}")
-    print(f"[INFO] Fetching page: {TARGET_URL}")
+    sent_storage = load_sent_storage()
+    if not isinstance(sent_storage, dict):
+        sent_storage = {}
 
-    html = fetch_html(TARGET_URL)
-    articles = extract_new_articles(html, TARGET_URL, now_jst)
+    # 1) 각 사이트에서 지난 24시간 기사 수집
+    jp_articles = collect_recent_articles_jp()
+    kr_articles = collect_recent_articles_kr_ai()
 
-    if not articles:
-        print("[INFO] 조건에 맞는 기사가 없어요 (지난 24시간 & 新着).")
+    all_candidates: list[dict] = jp_articles + kr_articles
+    print(f"[ALL] 총 후보 기사 {len(all_candidates)}개")
+
+    # 2) 중복(이미 보낸 URL) 제거 + 일본 기사 제목 번역
+    new_items: list[dict] = []
+    for item in all_candidates:
+        url = item["url"]
+        if url in sent_storage:
+            print(f"[SKIP] 이미 전송한 기사라 스킵: {url}")
+            continue
+
+        if item.get("source") == "zdnet_jp":
+            ja = item.get("title_ja")
+            ko = translate_title_ja_to_ko(ja)
+            item["title_ko"] = ko
+
+        # 새 기사로 인정 → 스토리지에 기록
+        sent_storage[url] = datetime.utcnow().isoformat()
+        new_items.append(item)
+
+    print(f"[ALL] 새로 보낼 기사 {len(new_items)}개")
+
+    if not new_items:
+        print("[INFO] 보낼 새로운 기사가 없어요.")
         return
 
-    print(f"[INFO] {len(articles)}개의 후보 기사 발견")
+    # 3) 텔레그램 전송
+    send_to_telegram(new_items)
 
-    # 중복 방지: 이미 보낸 URL은 제외
-    seen = load_seen_urls(STORAGE_FILE)
-    print(f"[INFO] storage에서 {len(seen)}개 URL 로드")
-
-    new_articles = [item for item in articles if item["url"] not in seen]
-
-    if not new_articles:
-        print("[INFO] 새로 보낼 기사가 없어요 (모두 이미 전송된 URL).")
-        return
-
-    print(f"[INFO] 실제 전송 대상: {len(new_articles)}개")
-
-    # 제목 번역
-    for item in new_articles:
-        ja = item["title_ja"]
-        print(f"[INFO] Translating: {ja}")
-        ko = translate_title_ja_to_ko(ja)
-        item["title_ko"] = ko
-
-    # 텔레그램 전송
-    send_to_telegram(new_articles)
-
-    # storage 업데이트
-    for item in new_articles:
-        seen.add(item["url"])
-    save_seen_urls(STORAGE_FILE, seen)
-
+    # 4) 스토리지 저장
+    save_sent_storage(sent_storage)
     print("[INFO] 완료!")
 
 
