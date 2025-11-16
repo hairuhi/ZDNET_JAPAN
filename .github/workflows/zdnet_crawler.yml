@@ -1,19 +1,23 @@
-name: ZDNet JP Software Crawler
+name: ZDNet JP + KR Crawler
 
 on:
   schedule:
-    # JST 09:00 / 12:00 / 15:00 / 18:00
-    #   → UTC 기준으로 00, 03, 06, 09 시
+    # UTC 기준: 0,3,6,9시는 JST/KST로 9,12,15,18시
     - cron: "0 0,3,6,9 * * *"
   workflow_dispatch:
 
 jobs:
   crawl-and-send:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # sent_articles.json 커밋/푸시용
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,7 +33,25 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TARGET_URL: https://japan.zdnet.com/software/
-          STORAGE_FILE: seen_articles.json
+          # 필요하면 아래 값들도 Secrets 또는 env로 오버라이드 가능
+          # JAPAN_SOFTWARE_URL: https://japan.zdnet.com/software/
+          # KOREA_AI_URL: https://zdnet.co.kr/newskey/?lstcode=%EC%9D%B8%EA%B3%B5%EC%A7%80%EB%8A%A5
+          STORAGE_PATH: sent_articles.json
         run: |
           python main.py
+
+      - name: Commit sent_articles.json (for dedup)
+        run: |
+          if [ -f "sent_articles.json" ]; then
+            if [ -n "$(git status --porcelain sent_articles.json)" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add sent_articles.json
+              git commit -m "Update sent_articles.json [skip ci]" || true
+              git push
+            else
+              echo "sent_articles.json 변경 없음"
+            fi
+          else
+            echo "sent_articles.json 파일이 없어요"
+          fi
